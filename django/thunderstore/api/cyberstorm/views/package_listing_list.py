@@ -1,11 +1,13 @@
 from copy import deepcopy
+from datetime import datetime, time
 from typing import List, Optional, OrderedDict, Tuple
 from urllib.parse import urlencode
 
 from django.conf import settings
 from django.core.paginator import Page
-from django.db.models import Count, OuterRef, Q, QuerySet, Subquery, Sum
+from django.db.models import Count, Exists, OuterRef, Q, QuerySet, Subquery, Sum
 from django.urls import reverse
+from django.utils import timezone
 from django.utils.decorators import method_decorator
 from rest_framework import serializers
 from rest_framework.generics import ListAPIView, get_object_or_404
@@ -19,7 +21,12 @@ from thunderstore.community.models import (
     PackageListing,
     PackageListingSection,
 )
-from thunderstore.repository.models import Namespace, Package, get_package_dependants
+from thunderstore.repository.models import (
+    Namespace,
+    Package,
+    PackageVersion,
+    get_package_dependants,
+)
 
 # Keys are values expected in requests, values are args for .order_by().
 ORDER_ARGS = {
@@ -52,6 +59,10 @@ class PackageListRequestSerializer(serializers.Serializer):
     page = serializers.IntegerField(default=1, min_value=1)
     q = serializers.CharField(required=False, help_text="Free text search")
     section = serializers.UUIDField(required=False)
+    updated_before = serializers.DateField(required=False)
+    updated_after = serializers.DateField(required=False)
+    created_before = serializers.DateField(required=False)
+    created_after = serializers.DateField(required=False)
 
 
 class PackageListResponseSerializer(serializers.Serializer):
@@ -151,6 +162,12 @@ class BasePackageListAPIView(ListAPIView):
         qs = filter_not_in_categories(params["excluded_categories"], qs)
         qs = filter_by_section(params.get("section"), qs)
         qs = filter_by_query(params.get("q"), qs)
+        qs = filter_by_date(
+            False, params.get("updated_before"), params.get("updated_after"), qs
+        )
+        qs = filter_by_date(
+            True, params.get("created_before"), params.get("created_after"), qs
+        )
 
         return qs.order_by(
             "-is_pinned",
@@ -461,6 +478,44 @@ def filter_by_query(
             icontains_query &= ~Q(**{f"{field}__icontains": part})
 
     return queryset.exclude(icontains_query).distinct()
+
+
+def filter_by_date(
+    is_creation_date: bool,
+    before: Optional[datetime],
+    after: Optional[datetime],
+    queryset: QuerySet[Package],
+) -> QuerySet[Package]:
+    """
+    Filter out packages that aren't in a date range
+    """
+    if not after and not before:
+        return queryset
+
+    if before:
+        # From 2024-01-01 to 2024-01-02 should include all packages uploaded on 2024-01-02
+        before = datetime.combine(before, time.max, tzinfo=timezone.utc)
+
+    if not before:
+        before = timezone.now()
+    if not after:
+        after = datetime(2000, 1, 1)
+
+    if is_creation_date:
+        return (
+            queryset.exclude(date_created__gte=before)
+            .exclude(date_created__lte=after)
+            .distinct()
+        )
+    else:
+        versions = PackageVersion.objects.filter(
+            package=OuterRef("pk"), date_created__lte=before, date_created__gte=after
+        )
+        return (
+            queryset.annotate(has_matching_versions=Exists(versions))
+            .filter(has_matching_versions=True)
+            .distinct()
+        )
 
 
 def filter_by_review_status(
